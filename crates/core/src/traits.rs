@@ -1,4 +1,3 @@
-// core/traits.rs
 use async_trait::async_trait;
 use futures::stream::Stream;
 use crate::errors::AdapterResult;

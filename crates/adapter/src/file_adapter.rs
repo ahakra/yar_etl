@@ -17,8 +17,10 @@ pub struct FileAdapterConfig {
     pub error_path: Option<PathBuf>,
     pub file_pattern: Option<String>,  // Regex pattern for files
     pub recursive: bool,
+    pub parallel_files: bool,           // Whether to process files in parallel
+    pub max_concurrent_files: usize,    // Max number of files to process concurrently
 }
-
+#[derive(Debug, Clone)]
 pub struct FileAdapter {
     config: FileAdapterConfig,
 }
@@ -98,6 +100,24 @@ impl FileAdapter {
     async fn stream_async(&self) -> AdapterResult<impl Stream<Item = AdapterResult<RawRecord>>> {
         let files = self.collect_files().await?;
 
+        if files.is_empty() {
+            return Ok(futures::stream::empty().boxed());
+        }
+
+        if self.config.parallel_files {
+            // Process files in parallel
+            self.stream_parallel(files).await
+        } else {
+            // Process files sequentially
+            self.stream_sequential(files).await
+        }
+    }
+
+    /// Sequential processing: one file at a time
+    async fn stream_sequential(
+        &self,
+        files: Vec<PathBuf>
+    ) -> AdapterResult<impl Stream<Item = AdapterResult<RawRecord>>> {
         let stream = stream! {
             for file in files {
                 let mut file_stream = match self.stream_file_async(&file).await {
@@ -113,6 +133,37 @@ impl FileAdapter {
                 }
             }
         };
+
+        Ok(stream)
+    }
+
+    /// Parallel processing: multiple files at once
+    async fn stream_parallel(
+        &self,
+        files: Vec<PathBuf>
+    ) -> AdapterResult<impl Stream<Item = AdapterResult<RawRecord>>> {
+        let max_concurrent = self.config.max_concurrent_files;
+
+        // Create a stream that processes files concurrently
+        let stream = futures::stream::iter(files)
+            .map(|file| {
+                let adapter = self.clone(); // You'll need to derive Clone for FileAdapter
+                tokio::spawn(async move {
+                    adapter.stream_file_async(&file).await
+                })
+            })
+            .buffer_unordered(max_concurrent)
+            .filter_map(|result| async move {
+                match result {
+                    Ok(Ok(stream)) => Some(stream),
+                    Ok(Err(e)) => Some(futures::stream::once(async move { Err(e) }).boxed()),
+                    Err(e) => Some(futures::stream::once(async move {
+                        Err(AdapterError::Io(e.to_string()))
+                    }).boxed()),
+                }
+            })
+            .flatten()
+            .boxed();
 
         Ok(stream)
     }
